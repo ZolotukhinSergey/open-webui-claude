@@ -500,6 +500,7 @@ from open_webui.routers import (
     openai,
     pipelines,
     prompts,
+    proxy_users,
     retrieval,
     scim,
     skills,
@@ -1412,6 +1413,7 @@ app.mount('/ws', socket_app)
 
 app.include_router(ollama.router, prefix='/ollama', tags=['ollama'])
 app.include_router(openai.router, prefix='/openai', tags=['openai'])
+app.include_router(proxy_users.router, prefix='/api/v1/proxy-users', tags=['proxy-users'])
 
 
 app.include_router(pipelines.router, prefix='/api/v1/pipelines', tags=['pipelines'])
