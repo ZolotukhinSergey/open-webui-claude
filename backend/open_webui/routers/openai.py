@@ -36,6 +36,11 @@ from open_webui.internal.db import get_async_session
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.groups import Groups
 from open_webui.models.models import Models
+from open_webui.models.proxy_users import (
+    ProxyUserConfigs,
+    ProxyUsageLogs,
+    check_user_token_limits,
+)
 from open_webui.models.users import UserModel
 from open_webui.utils.access_control import check_model_access, has_connection_access
 from open_webui.utils.anthropic import get_anthropic_models, is_anthropic_url
@@ -58,6 +63,58 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
+
+
+##########################################
+#
+# Proxy usage tracking helpers
+#
+##########################################
+
+
+def _count_files_in_messages(messages: list) -> int:
+    """Count non-text content parts (images / file attachments) in request messages."""
+    count = 0
+    for msg in messages:
+        content = msg.get('content')
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get('type') not in ('text', None):
+                    count += 1
+    return count
+
+
+async def _tracking_stream(
+    stream_gen,
+    user_id: str,
+    model: str,
+    files_sent: int,
+):
+    """Yield all SSE chunks from *stream_gen* and log usage once the stream ends."""
+    last_usage: dict = {}
+    async for chunk in stream_gen:
+        yield chunk
+        # Parse SSE lines to capture the usage chunk emitted by providers
+        text = chunk.decode('utf-8', errors='ignore') if isinstance(chunk, bytes) else chunk
+        for line in text.split('\n'):
+            if line.startswith('data: ') and not line.startswith('data: [DONE]'):
+                try:
+                    data = json.loads(line[6:])
+                    if data.get('usage'):
+                        last_usage = data['usage']
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+    asyncio.ensure_future(
+        ProxyUsageLogs.create_log(
+            user_id=user_id,
+            model=model,
+            prompt_tokens=last_usage.get('prompt_tokens', 0),
+            completion_tokens=last_usage.get('completion_tokens', 0),
+            total_tokens=last_usage.get('total_tokens', 0),
+            files_sent=files_sent,
+        )
+    )
 
 
 ##########################################
@@ -1138,6 +1195,20 @@ async def generate_chat_completion(
     url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
     key = request.app.state.config.OPENAI_API_KEYS[idx]
 
+    # Check proxy user config: per-user API key and token limits
+    proxy_config = await ProxyUserConfigs.get_config(user.id)
+    if proxy_config and proxy_config.is_active:
+        # Use user-specific API key when configured
+        if proxy_config.api_key:
+            key = proxy_config.api_key
+        # Enforce token limits
+        allowed, limit_msg = await check_user_token_limits(user.id, proxy_config)
+        if not allowed:
+            raise HTTPException(status_code=429, detail=limit_msg)
+
+    # Count files/images being sent to the AI for usage tracking
+    _files_sent = _count_files_in_messages(payload.get('messages', []))
+
     # Check if model is a reasoning model that needs special handling
     if is_openai_new_model(payload['model']):
         payload = openai_reasoning_model_handler(payload)
@@ -1243,8 +1314,15 @@ async def generate_chat_completion(
                     )
 
             streaming = True
+            base_stream = stream_wrapper(r, content_handler=stream_chunks_handler)
+            tracked_stream = _tracking_stream(
+                base_stream,
+                user_id=user.id,
+                model=form_data.get('model', ''),
+                files_sent=_files_sent,
+            )
             return StreamingResponse(
-                stream_wrapper(r, content_handler=stream_chunks_handler),
+                tracked_stream,
                 status_code=r.status,
                 headers=_clean_proxy_headers(r.headers),
             )
@@ -1264,6 +1342,20 @@ async def generate_chat_completion(
             # Convert Responses API result to simple format
             if is_responses and isinstance(response, dict):
                 response = convert_responses_result(response)
+
+            # Log usage for non-streaming responses
+            if isinstance(response, dict):
+                _usage = response.get('usage', {}) or {}
+                asyncio.ensure_future(
+                    ProxyUsageLogs.create_log(
+                        user_id=user.id,
+                        model=form_data.get('model', ''),
+                        prompt_tokens=_usage.get('prompt_tokens', 0),
+                        completion_tokens=_usage.get('completion_tokens', 0),
+                        total_tokens=_usage.get('total_tokens', 0),
+                        files_sent=_files_sent,
+                    )
+                )
 
             return response
     except Exception as e:
